@@ -1,0 +1,1064 @@
+# LABOKit Plugin: Dithering FX v3.3
+# ID: labokit.dithering
+# Author: Kano
+
+import os
+import shutil
+import random
+import tempfile
+import time
+import sys
+from pathlib import Path
+from PIL import Image, ImageOps, ImageFilter, ImageChops, ImageSequence, ImageEnhance
+from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal
+from PySide6.QtGui import QPixmap, QFont, QColor, QImage, QMovie
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QListWidgetItem,
+    QLabel, QPushButton, QFileDialog, QMessageBox, QProgressDialog,
+    QFrame, QComboBox, QCheckBox, QApplication, QSlider,
+    QColorDialog, QToolBox
+)
+from ui_shared import FileDropListWidget, ZoomableImageWidget, create_plus_icon
+
+# Import Translations
+try:
+    from translations import tr
+except ImportError:
+    # Fallback if running standalone or path issue
+    def tr(key, default=None): return default if default else key
+
+PLUGIN_ID = "labokit.dithering"
+PLUGIN_NAME = "Dithering FX"
+PLUGIN_VERSION = "3.4"
+HELP_TEXT = (
+    "<h3>Dithering FX</h3>"
+    "<p>Retro dithering effects for your images.</p>"
+    "<hr>"
+    "<b>Features:</b>"
+    "<ul>"
+    "<li><b>Palettes:</b> C64, NES, Apple II, GameBoy, Custom, and more.</li>"
+    "<li><b>Algorithms:</b> Floyd-Steinberg, Atkinson (True Error Diffusion), Stucki, Burkes, Ordered.</li>"
+    "<li><b>Advanced Control:</b> Adjust softness, noise, and error bleed.</li>"
+    "<li><b>Pre-Process:</b> Adjust brightness/contrast before dithering.</li>"
+    "<li><b>Bloom:</b> Add a retro glow effect.</li>"
+    "<li><b>GIF Support:</b> Import, Process, and Preview animated GIFs!</li>"
+    "</ul>"
+)
+
+IMAGE_FILTER = "Images (*.jpg *.png *.bmp *.webp)"
+GIF_FILTER = "Animated GIF (*.gif)"
+
+CACHE_DIR = Path(os.getenv('APPDATA')) / "LABOKit" / "temp_cache"
+PREVIEW_MAX_SIZE = 800 
+
+# --- ASSETS ---
+PALETTES = {
+    "1-Bit (B&W)": [0,0,0, 255,255,255],
+    "GameBoy (Classic)": [15,56,15, 48,98,48, 139,172,15, 155,188,15],
+    "GameBoy (Pocket)": [0,0,0, 100,100,100, 180,180,180, 255,255,255],
+    "GB Green": [8,24,32, 52,104,86, 136,192,112, 224,248,208],
+    "GB Gray": [0,0,0, 103,103,103, 182,182,182, 255,255,255],
+    "C64 (Commodore)": [0,0,0, 255,255,255, 136,0,0, 170,255,238, 204,68,204, 0,204,85, 0,0,170, 238,238,119, 221,136,85, 102,68,0, 255,119,119, 51,51,51, 119,119,119, 170,255,102, 0,136,255, 187,187,187],
+    "NES": [124,124,124, 0,0,252, 0,0,188, 68,40,188, 148,0,132, 168,0,32, 168,16,0, 136,20,0, 80,48,0, 0,120,0, 0,104,0, 0,88,0, 0,64,88, 0,0,0, 0,0,0, 0,0,0, 188,188,188, 0,120,248, 0,88,248, 104,68,252, 216,0,204, 228,0,88, 248,56,0, 228,92,16, 172,124,0, 0,184,0, 0,168,0, 0,168,68, 0,136,136, 0,0,0, 0,0,0, 0,0,0, 248,248,248, 60,188,252, 104,136,252, 152,120,248, 248,120,248, 248,88,152, 248,120,88, 252,160,68, 248,184,0, 184,248,24, 88,216,84, 88,248,152, 0,232,216, 120,120,120, 0,0,0, 0,0,0, 252,252,252, 164,228,252, 184,184,248, 216,184,248, 248,184,248, 248,164,192, 240,208,176, 252,224,168, 248,216,120, 216,248,120, 184,248,184, 184,248,216, 0,252,252, 248,216,248, 0,0,0, 0,0,0],
+    "Apple II": [0,0,0, 64,51,83, 114,38,64, 194,77,220, 20,68,36, 81,114,121, 122,106,97, 192,162,185, 46,72,0, 107,117,80, 153,102,0, 227,159,85, 68,140,43, 122,192,129, 172,217,99, 172,217,99, 255,255,255],
+    "EGA (16)": [0,0,0, 0,0,170, 0,170,0, 0,170,170, 170,0,0, 170,0,170, 170,85,0, 170,170,170, 85,85,85, 85,85,255, 85,255,85, 85,255,255, 255,85,85, 255,85,255, 255,255,85, 255,255,255],
+    "CGA Mode 4": [0,0,0, 85,255,255, 255,85,255, 255,255,255],
+    "ZX Spectrum": [0,0,0, 0,0,215, 215,0,0, 215,0,215, 0,215,0, 0,215,215, 215,215,0, 215,215,215],
+    "MSX": [0,0,0, 1,1,1, 62,184,73, 116,208,125, 89,85,224, 128,118,241, 185,94,81, 255,137,109, 66,196,248, 255,101,89, 204,204,77, 222,222,138, 58,162,65, 179,100,229, 204,204,204, 255,255,255],
+    "Sepia 3": [70,50,30, 160,130,100, 240,220,190],
+    "Cyberpunk 3": [10,0,30, 255,0,100, 0,255,255],
+    "Virtual Boy": [0,0,0, 85,0,0, 170,0,0, 255,0,0],
+    "Teletext": [0,0,0, 255,0,0, 0,255,0, 255,255,0, 0,0,255, 255,0,255, 0,255,255, 255,255,255],
+    "Custom (User Defined)": [] 
+}
+
+# --- MATRICES ---
+BAYER_4x4 = [[0,32,8,40],[48,16,56,24],[12,44,4,36],[60,28,52,20]]
+LINES_DIAG = [[10,20,30,40],[40,10,20,30],[30,40,10,20],[20,30,40,10]]
+LINES_HORZ = [[0, 0, 0, 0],[32, 32, 32, 32],[48, 48, 48, 48],[16, 16, 16, 16]]
+LINES_VERT = [[0, 32, 48, 16],[0, 32, 48, 16],[0, 32, 48, 16],[0, 32, 48, 16]]
+
+# --- ERROR DIFFUSION KERNELS ---
+KERNELS = {
+    "Atkinson": {
+        "offsets": [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1), (1, 1, 1), (0, 2, 1)],
+        "divisor": 8 
+    },
+    "Stucki": {
+        "offsets": [
+            (1, 0, 8), (2, 0, 4), 
+            (-2, 1, 2), (-1, 1, 4), (0, 1, 8), (1, 1, 4), (2, 1, 2),
+            (-2, 2, 1), (-1, 2, 2), (0, 2, 4), (1, 2, 2), (2, 2, 1)
+        ],
+        "divisor": 42
+    },
+    "Sierra": {
+        "offsets": [
+            (1, 0, 5), (2, 0, 3),
+            (-2, 1, 2), (-1, 1, 4), (0, 1, 5), (1, 1, 4), (2, 1, 2),
+            (-1, 2, 2), (0, 2, 3), (1, 2, 2)
+        ],
+        "divisor": 32
+    },
+    "Burkes": {
+        "offsets": [
+            (1, 0, 8), (2, 0, 4),
+            (-2, 1, 2), (-1, 1, 4), (0, 1, 8), (1, 1, 4), (2, 1, 2)
+        ],
+        "divisor": 32
+    }
+}
+
+# --- SHARED PROCESSING LOGIC ---
+def process_dithering(img_pil, params, custom_cols):
+    frame_idx = params.get("frame_idx", 0)
+    anim_mode = params.get("anim_mode", "Scrolling Pattern")
+
+    # 1. Resize Down
+    original_w, original_h = img_pil.size
+    scale_factor = params.get("scale", 1)
+    target_w, target_h = original_w, original_h
+    
+    if scale_factor > 1:
+        target_w = max(1, target_w // scale_factor)
+        target_h = max(1, target_h // scale_factor)
+        img_pil = img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    # 2. Pre-Process
+    bright = params.get("brightness", 0)
+    contrast = params.get("contrast", 1.0)
+    softness = params.get("softness", 0)
+    noise_amt = params.get("noise", 0)
+    
+    if bright != 0:
+        factor = 1.0 + (bright / 100.0)
+        img_pil = ImageEnhance.Brightness(img_pil).enhance(factor)
+        
+    if contrast != 1.0:
+        img_pil = ImageEnhance.Contrast(img_pil).enhance(contrast)
+        
+    if softness > 0:
+        img_pil = img_pil.filter(ImageFilter.GaussianBlur(softness / 10.0))
+        
+    # If Jitter/Noise animation is selected, add subtle noise per frame
+    if frame_idx > 0 and anim_mode == "Jitter / Noise":
+        rng = random.Random(frame_idx)
+        w, h = img_pil.size
+        noise_bytes = bytes(rng.randint(0, 255) for _ in range(w * h))
+        noise_img = Image.frombytes("L", (w, h), noise_bytes).convert("RGB")
+        if img_pil.mode != 'RGB': img_pil = img_pil.convert('RGB')
+        img_pil = Image.blend(img_pil, noise_img, 0.05)
+        
+    if noise_amt > 0:
+        w, h = img_pil.size
+        noise = Image.effect_noise((w, h), noise_amt).convert("RGB")
+        if img_pil.mode != 'RGB': img_pil = img_pil.convert('RGB')
+        img_pil = ImageChops.screen(img_pil, noise) 
+
+    # 3. Dither
+    palette_name = params.get("palette", "1-Bit (B&W)")
+    if "Custom" in palette_name and custom_cols:
+        rgb = custom_cols[0] + custom_cols[1]
+    else:
+        rgb = PALETTES.get(palette_name, PALETTES["1-Bit (B&W)"])
+        
+    full_pal = rgb + [0] * (768 - len(rgb))
+    p_img = Image.new('P', (1, 1)); p_img.putpalette(full_pal)
+    
+    img_gray = img_pil.convert("L")
+    mode = params.get("mode", "Floyd")
+
+    if "Floyd" in mode:
+        working_img = img_pil.convert("RGB")
+        dithered = working_img.quantize(palette=p_img, dither=Image.Dither.FLOYDSTEINBERG)
+    elif mode in KERNELS:
+        bleed = params.get("bleed", 1.0)
+        dithered = _error_diffusion(img_gray, p_img, KERNELS[mode], bleed)
+    elif "Bayer" in mode: dithered = _map_pattern(img_gray, p_img, "bayer4", frame_idx, anim_mode)
+    elif "Lines (Diagonal)" in mode: dithered = _map_pattern(img_gray, p_img, "lines_d", frame_idx, anim_mode)
+    elif "Lines (Horizontal)" in mode: dithered = _map_pattern(img_gray, p_img, "lines_h", frame_idx, anim_mode)
+    elif "Lines (Vertical)" in mode: dithered = _map_pattern(img_gray, p_img, "lines_v", frame_idx, anim_mode)
+    elif "Halftone" in mode: dithered = _map_pattern(img_gray, p_img, "halftone", frame_idx, anim_mode)
+    elif "Noise" in mode: dithered = _map_pattern(img_gray, p_img, "noise", frame_idx, anim_mode)
+    else:
+        working_img = img_pil.convert("RGB")
+        dithered = working_img.quantize(palette=p_img, dither=Image.Dither.NONE)
+
+    # 4. Bloom (Post-Dither)
+    bloom_int = params.get("bloom_intensity", 0)
+    bloom_rad = params.get("bloom_radius", 0)
+    
+    result = dithered.convert("RGB") 
+    
+    if bloom_int > 0:
+        glow = result.filter(ImageFilter.GaussianBlur(bloom_rad))
+        glow = ImageEnhance.Brightness(glow).enhance(bloom_int / 50.0)
+        result = ImageChops.add(result, glow)
+
+    # 5. Restore Size
+    if result.size != (original_w, original_h):
+            result = result.resize((original_w, original_h), Image.Resampling.NEAREST)
+
+    return result
+
+def _map_pattern(gray, pal_img, p_type, frame_idx=0, anim_mode="Scrolling Pattern"):
+    w, h = gray.size
+    pat = Image.new("L", (w, h))
+    data = []
+    
+    offset_x = 0
+    offset_y = 0
+    if frame_idx > 0:
+        if anim_mode == "Scrolling Pattern":
+            offset_x = frame_idx
+            offset_y = frame_idx
+        elif anim_mode == "Jitter / Noise":
+            rng = random.Random(frame_idx)
+            offset_x = rng.randint(0, 16)
+            offset_y = rng.randint(0, 16)
+            
+    def build_pattern(matrix, scale=4):
+        rows = len(matrix)
+        cols = len(matrix[0])
+        scaled = [[v * scale for v in r] for r in matrix]
+        for y in range(h):
+            r_idx = (y + offset_y) % rows
+            row = scaled[r_idx]
+            shifted = [row[(x + offset_x) % cols] for x in range(cols)]
+            repeats = (w // cols) + 1
+            data.extend((shifted * repeats)[:w])
+
+    if p_type == "bayer4": build_pattern(BAYER_4x4)
+    elif p_type == "lines_d": build_pattern(LINES_DIAG)
+    elif p_type == "lines_h": build_pattern(LINES_HORZ)
+    elif p_type == "lines_v": build_pattern(LINES_VERT)
+    elif p_type == "halftone":
+        dots = [[0, 100, 100, 0], [100, 255, 255, 100], [100, 255, 255, 100], [0, 100, 100, 0]]
+        build_pattern(dots, 1)
+    elif p_type == "noise":
+        if frame_idx > 0:
+            rng = random.Random(frame_idx)
+            noise_bytes = bytes(rng.randint(0, 255) for _ in range(w * h))
+            noise = Image.frombytes("L", (w, h), noise_bytes)
+        else:
+            noise = Image.effect_noise((w, h), 40)
+        return ImageChops.add(gray, ImageChops.subtract(noise, Image.new("L", (w,h), 128))).convert("RGB").quantize(palette=pal_img, dither=Image.Dither.NONE)
+    
+    if data: pat.putdata(data)
+    dithered = ImageChops.add(gray, ImageChops.subtract(pat, Image.new("L", (w,h), 128)))
+    return dithered.convert("RGB").quantize(palette=pal_img, dither=Image.Dither.NONE)
+
+def _error_diffusion(img_gray, pal_img, kernel_info, bleed):
+    offsets = kernel_info["offsets"]
+    divisor = float(kernel_info["divisor"])
+    
+    pal_bytes = pal_img.getpalette()
+    pal_lums = []
+    for i in range(0, len(pal_bytes), 3):
+        if i+2 < len(pal_bytes):
+            r, g, b = pal_bytes[i], pal_bytes[i+1], pal_bytes[i+2]
+            lum = int(0.299*r + 0.587*g + 0.114*b)
+            if lum not in pal_lums:
+                pal_lums.append(lum)
+                
+    # Pre-compute lookup table for nearest luminance
+    lookup = [min(pal_lums, key=lambda l: abs(l - val)) for val in range(256)]
+    
+    w, h = img_gray.size
+    pixels = img_gray.load() 
+    
+    # Pre-allocate 1D flat buffer for faster indexing
+    buffer = [0.0] * (w * h)
+    for y in range(h):
+        idx = y * w
+        for x in range(w):
+            buffer[idx + x] = pixels[x, y]
+            
+    # Process
+    for y in range(h):
+        idx = y * w
+        for x in range(w):
+            old_val = buffer[idx + x]
+            
+            # Clamp value
+            if old_val < 0: clamped_val = 0
+            elif old_val > 255: clamped_val = 255
+            else: clamped_val = int(old_val)
+                
+            nearest_lum = lookup[clamped_val]
+            pixels[x, y] = nearest_lum
+            
+            err = (old_val - nearest_lum) * bleed
+            if err == 0:
+                continue
+                
+            for dx, dy, weight in offsets:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and ny < h:
+                    buffer[ny * w + nx] += err * (weight / divisor)
+
+    return img_gray.convert("RGB").quantize(palette=pal_img, dither=Image.Dither.NONE)
+
+# --- THREADS ---
+class PreviewWorker(QThread):
+    finished = Signal(object) 
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.img_proxy = None
+        self.params = {}
+        self.custom_cols = None
+
+    def set_data(self, img_proxy, params, custom_cols):
+        self.img_proxy = img_proxy
+        self.params = params
+        self.custom_cols = custom_cols
+
+    def run(self):
+        if not self.img_proxy:
+            self.finished.emit(None)
+            return
+        
+        try:
+            work_img = self.img_proxy.copy()
+            res = process_dithering(work_img, self.params, self.custom_cols)
+            
+            display_img = res.convert("RGBA")
+            data = display_img.tobytes("raw", "RGBA")
+            qim = QImage(data, display_img.width, display_img.height, QImage.Format_RGBA8888).copy()
+            pix_res = QPixmap.fromImage(qim)
+            
+            self.finished.emit(pix_res)
+        except Exception as e:
+            print(f"Preview Error: {e}")
+            self.finished.emit(None)
+
+class BatchDitherWorker(QThread):
+    progress = Signal(int, str)
+    finished = Signal(int)
+    error = Signal(str)
+    
+    def __init__(self, paths, out_dir, params, custom_cols, parent=None):
+        super().__init__(parent)
+        self.paths = paths
+        self.out_dir = out_dir
+        self.params = params
+        self.custom_cols = custom_cols
+        self._is_running = True
+
+    def run(self):
+        pal_name = self.params.get("palette", "1-Bit").split()[0]
+        mode_name = self.params.get("mode", "Floyd").split()[0]
+        suffix = f"{pal_name}_{mode_name}_{self.params.get('scale')}x"
+
+        cnt = 0
+        for i, p in enumerate(self.paths):
+            if not self._is_running: break
+            self.progress.emit(i, f"Processing {p.name}...")
+            
+            try:
+                original_p = p 
+                is_gif = p.suffix.lower() == ".gif"
+                
+                if is_gif:
+                    with Image.open(p) as im:
+                        frames = []
+                        durations = []
+                        
+                        for idx, frame in enumerate(ImageSequence.Iterator(im)):
+                            frame = frame.convert("RGBA")
+                            frame_params = self.params.copy()
+                            frame_params["frame_idx"] = idx
+                            res = process_dithering(frame, frame_params, self.custom_cols)
+                            frames.append(res)
+                            durations.append(im.info.get('duration', 100))
+                        
+                        out_name = f"{original_p.stem}_dither_{suffix}.gif"
+                        save_path = self.out_dir / out_name
+                        
+                        frames[0].save(
+                            save_path,
+                            save_all=True,
+                            append_images=frames[1:],
+                            duration=durations,
+                            loop=0
+                        )
+                else:
+                    with Image.open(p) as img:
+                        img = ImageOps.exif_transpose(img)
+                        
+                        animate = self.params.get("animate_static", False)
+                        anim_frames = self.params.get("anim_frames", 8)
+                        anim_speed = self.params.get("anim_speed", 100)
+                        
+                        if animate:
+                            frames = []
+                            durations = []
+                            for idx in range(anim_frames):
+                                frame_copy = img.copy()
+                                frame_params = self.params.copy()
+                                frame_params["frame_idx"] = idx
+                                res = process_dithering(frame_copy, frame_params, self.custom_cols)
+                                frames.append(res)
+                                durations.append(anim_speed)
+                                
+                            out_name = f"{original_p.stem}_dither_anim_{suffix}.gif"
+                            save_path = self.out_dir / out_name
+                            frames[0].save(
+                                save_path,
+                                save_all=True,
+                                append_images=frames[1:],
+                                duration=durations,
+                                loop=0
+                            )
+                        else:
+                            res = process_dithering(img, self.params, self.custom_cols)
+                            out_name = f"{original_p.stem}_dither_{suffix}.png"
+                            res.save(self.out_dir / out_name)
+                
+                cnt += 1
+            except Exception as e:
+                print(f"Error {p.name}: {e}")
+        
+        self.finished.emit(cnt)
+
+    def stop(self):
+        self._is_running = False
+
+# --- MAIN TAB ---
+class DitheringTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.meter = None
+        self.image_paths = [] 
+        self.path_map = {} 
+        self.output_dir = None
+        self.current_preview_path = None
+        
+        self.preview_proxy_img = None 
+        self.loaded_proxy_path = ""
+
+        self.custom_col_1 = [0, 0, 0]
+        self.custom_col_2 = [255, 255, 255]
+        
+        self.preview_worker = PreviewWorker()
+        self.preview_worker.finished.connect(self.on_preview_ready)
+        
+        self.debounce_timer = QTimer()
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.setInterval(200) 
+        self.debounce_timer.timeout.connect(self.start_preview_worker)
+        
+        # UI Styling (Light Mode & ImageLAB Consistency)
+        self.content_frame = QFrame(self)
+        self.content_frame.setObjectName("DitheringContent")
+        self.content_frame.setStyleSheet("""
+            #DitheringContent { background: transparent; }
+            #DitheringContent QLabel { color: #1c2333; }
+            
+            #DitheringContent QLabel[role="title"] { font-weight: bold; border: none; background: transparent; color: #1c2333; }
+            
+            #DitheringContent QToolBox QWidget { 
+                background-color: #f7f9fc; 
+                border-radius: 4px; 
+            }
+            #DitheringContent QToolBox::tab {
+                color: #1c2333; font-weight: bold; background-color: #e1e6f0;
+                border: 1px solid #b3bcd1; border-radius: 4px;
+            }
+            #DitheringContent QToolBox::tab:selected { background-color: #d4e3fc; font-style: italic; }
+
+            #DitheringContent QSlider::handle:horizontal { 
+                background: #2c3e50; 
+                border: 1px solid #2c3e50; 
+                width: 14px; 
+                margin: -4px 0; 
+                border-radius: 7px; 
+            }
+            #DitheringContent QSlider::groove:horizontal {
+                border: 1px solid #999999;
+                height: 6px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #B1B1B1, stop:1 #c4c4c4);
+                margin: 2px 0;
+                border-radius: 3px;
+            }
+            #DitheringContent QComboBox { background-color: #fff; color: #1c2333; border: 1px solid #b3bcd1; }
+            #DitheringContent QComboBox QAbstractItemView { background-color: #fff; color: #1c2333; selection-background-color: #d4e3fc; }
+            
+            /* Match ImageLAB Button Style */
+            #DitheringContent QPushButton {
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #d8dfee);
+                border: 1px solid #9ca7c2; border-radius: 5px; padding: 4px 12px; font-weight: bold; color: #1c2333;
+            }
+            #DitheringContent QPushButton:hover { background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #e6ecf7); }
+            #DitheringContent QPushButton:pressed { background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #cfd6e8, stop:1 #b0bdd7); }
+            
+            #DitheringContent QPushButton:disabled {
+                background-color: #e0e0e0;
+                color: #a0a0a0;
+                border: 1px solid #ccc;
+            }
+            
+            #DitheringContent QListWidget { background-color: #fff; color: #1c2333; border: 1px solid #b3bcd1; }
+        """)
+
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self._setup_ui()
+
+    def set_meter(self, meter):
+        self.meter = meter
+
+    def _setup_ui(self):
+        master_layout = QVBoxLayout(self)
+        master_layout.setContentsMargins(0,0,0,0)
+        master_layout.addWidget(self.content_frame)
+
+        outer = QVBoxLayout(self.content_frame)
+        outer.setContentsMargins(8, 8, 8, 8); outer.setSpacing(6)
+        main_layout = QHBoxLayout(); outer.addLayout(main_layout)
+        
+        # LEFT (Controls)
+        left_layout = QVBoxLayout(); main_layout.addLayout(left_layout, 1)
+        
+        # Loaded Images Box
+        list_box = QFrame()
+        list_box_layout = QVBoxLayout(list_box)
+        list_box_layout.setContentsMargins(6, 6, 6, 6)
+        list_box_layout.setSpacing(5)
+        
+        lbl_list = QLabel(tr("lbl_loaded", "LOADED IMAGES:"))
+        lbl_list.setObjectName("SectionHeader")
+        lbl_list.setFont(QFont("Consolas", 10, QFont.Bold))
+        list_box_layout.addWidget(lbl_list)
+        
+        self.file_list = FileDropListWidget()
+        self.file_list.files_dropped.connect(self.add_dropped_files)
+        self.file_list.currentItemChanged.connect(self.on_file_selected)
+        list_box_layout.addWidget(self.file_list)
+        
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton(tr("btn_add", "Add Images…")); btn_add.setIcon(create_plus_icon()); btn_add.clicked.connect(self.add_images)
+        btn_add_gif = QPushButton(tr("dfx_btn_gif", "Add GIF")); btn_add_gif.setIcon(create_plus_icon()); btn_add_gif.clicked.connect(self.add_gif)
+        btn_clear = QPushButton(tr("btn_clear", "Clear List")); btn_clear.clicked.connect(self.clear_list)
+        btn_row.addWidget(btn_add); btn_row.addWidget(btn_add_gif); btn_row.addWidget(btn_clear)
+        list_box_layout.addLayout(btn_row)
+
+        left_layout.addWidget(list_box)
+
+        l_out = QLabel(tr("lbl_out", "Output Folder:")); l_out.setProperty("role", "title"); l_out.setStyleSheet("margin-top: 10px;")
+        left_layout.addWidget(l_out)
+        self.output_label = QLabel("(auto)"); self.output_label.setWordWrap(True)
+        self.output_label.setStyleSheet("color: #666; margin-bottom: 5px; border: none; background: transparent;")
+        left_layout.addWidget(self.output_label)
+        
+        out_btn_lay = QHBoxLayout()
+        out_btn_lay.setSpacing(5)
+        btn_change = QPushButton(tr("btn_change", "Change Folder")); btn_change.clicked.connect(self.change_output_folder)
+        btn_open = QPushButton(tr("btn_open_out", "Open Output Folder")); btn_open.clicked.connect(self.open_output_folder)
+        out_btn_lay.addWidget(btn_change)
+        out_btn_lay.addWidget(btn_open)
+        left_layout.addLayout(out_btn_lay)
+
+        self.toolbox = QToolBox()
+        
+        # 1. Dither Settings
+        page_dither = QWidget(); lay_dither = QVBoxLayout(page_dither)
+        
+        lbl_pal = QLabel(tr("dfx_palette", "Palette:")); lbl_pal.setProperty("role", "title")
+        lay_dither.addWidget(lbl_pal)
+        self.palette_combo = QComboBox()
+        self.palette_combo.addItems(list(PALETTES.keys()))
+        self.palette_combo.currentTextChanged.connect(self.on_palette_change)
+        lay_dither.addWidget(self.palette_combo)
+        
+        self.btn_pick_color = QPushButton("Pick Custom Colors")
+        self.btn_pick_color.clicked.connect(self.pick_custom_colors)
+        self.btn_pick_color.setVisible(False)
+        lay_dither.addWidget(self.btn_pick_color)
+
+        lbl_mode = QLabel(tr("dfx_mode", "Dither Mode:")); lbl_mode.setProperty("role", "title")
+        lay_dither.addWidget(lbl_mode)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([
+            "Floyd-Steinberg (Diffusion)", "Bayer 4x4 (Ordered)",
+            "Lines (Diagonal)", "Lines (Horizontal)", "Lines (Vertical)", "Halftone (Dot)", 
+            "Atkinson", "Stucki", "Sierra", "Burkes", "Noise (Random)"
+        ])
+        self.mode_combo.currentTextChanged.connect(self.trigger_update)
+        lay_dither.addWidget(self.mode_combo)
+
+        lbl_str = QLabel(tr("dfx_strength", "Pixel Strength:")); lbl_str.setProperty("role", "title")
+        lay_dither.addWidget(lbl_str)
+        h_slide = QHBoxLayout()
+        self.scale_slider = QSlider(Qt.Horizontal); self.scale_slider.setRange(1, 16); self.scale_slider.setValue(4)
+        self.scale_slider.valueChanged.connect(self.update_scale_label)
+        self.scale_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_scale = QLabel("4x"); self.lbl_scale.setFixedWidth(30)
+        h_slide.addWidget(self.scale_slider); h_slide.addWidget(self.lbl_scale)
+        lay_dither.addLayout(h_slide)
+        
+        lay_dither.addStretch()
+        self.toolbox.addItem(page_dither, "Dither Settings")
+
+        # 2. Pre-Process
+        page_pre = QWidget(); lay_pre = QVBoxLayout(page_pre)
+        
+        lbl_br = QLabel("Brightness:"); lbl_br.setProperty("role", "title")
+        lay_pre.addWidget(lbl_br)
+        h_br = QHBoxLayout()
+        self.br_slider = QSlider(Qt.Horizontal); self.br_slider.setRange(-50, 50); self.br_slider.setValue(0)
+        self.br_slider.valueChanged.connect(lambda v: self.lbl_br_val.setText(str(v)))
+        self.br_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_br_val = QLabel("0"); self.lbl_br_val.setFixedWidth(30)
+        h_br.addWidget(self.br_slider); h_br.addWidget(self.lbl_br_val)
+        lay_pre.addLayout(h_br)
+
+        lbl_ct = QLabel("Contrast:"); lbl_ct.setProperty("role", "title")
+        lay_pre.addWidget(lbl_ct)
+        h_ct = QHBoxLayout()
+        self.ct_slider = QSlider(Qt.Horizontal); self.ct_slider.setRange(5, 20); self.ct_slider.setValue(10)
+        self.ct_slider.valueChanged.connect(lambda v: self.lbl_ct_val.setText(f"{v/10.0}"))
+        self.ct_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_ct_val = QLabel("1.0"); self.lbl_ct_val.setFixedWidth(30)
+        h_ct.addWidget(self.ct_slider); h_ct.addWidget(self.lbl_ct_val)
+        lay_pre.addLayout(h_ct)
+        
+        lay_pre.addStretch()
+        self.toolbox.addItem(page_pre, tr("dfx_pre", "Pre-Process"))
+
+        # 3. Effects (Bloom)
+        page_fx = QWidget(); lay_fx = QVBoxLayout(page_fx)
+        
+        lbl_bi = QLabel("Bloom Intensity:"); lbl_bi.setProperty("role", "title")
+        lay_fx.addWidget(lbl_bi)
+        h_bloom = QHBoxLayout()
+        self.bloom_int_slider = QSlider(Qt.Horizontal); self.bloom_int_slider.setRange(0, 100); self.bloom_int_slider.setValue(0)
+        self.bloom_int_slider.valueChanged.connect(self.update_bloom_label)
+        self.bloom_int_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_bloom_int = QLabel("0"); self.lbl_bloom_int.setFixedWidth(30)
+        h_bloom.addWidget(self.bloom_int_slider); h_bloom.addWidget(self.lbl_bloom_int)
+        lay_fx.addLayout(h_bloom)
+
+        lbl_br = QLabel("Bloom Radius:"); lbl_br.setProperty("role", "title")
+        lay_fx.addWidget(lbl_br)
+        h_rad = QHBoxLayout()
+        self.bloom_rad_slider = QSlider(Qt.Horizontal); self.bloom_rad_slider.setRange(1, 50); self.bloom_rad_slider.setValue(10)
+        self.bloom_rad_slider.valueChanged.connect(self.update_rad_label)
+        self.bloom_rad_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_bloom_rad = QLabel("10"); self.lbl_bloom_rad.setFixedWidth(30)
+        h_rad.addWidget(self.bloom_rad_slider); h_rad.addWidget(self.lbl_bloom_rad)
+        lay_fx.addLayout(h_rad)
+        
+        lay_fx.addStretch()
+        self.toolbox.addItem(page_fx, tr("dfx_bloom", "Glow / Bloom"))
+
+        # 4. Control (Manipulation)
+        page_ctrl = QWidget(); lay_ctrl = QVBoxLayout(page_ctrl)
+        
+        l1 = QLabel("Softness:"); l1.setProperty("role", "title")
+        lay_ctrl.addWidget(l1)
+        h_soft = QHBoxLayout()
+        self.soft_slider = QSlider(Qt.Horizontal); self.soft_slider.setRange(0, 50); self.soft_slider.setValue(0)
+        self.soft_slider.valueChanged.connect(lambda v: self.lbl_soft.setText(str(v)))
+        self.soft_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_soft = QLabel("0"); self.lbl_soft.setFixedWidth(30)
+        h_soft.addWidget(self.soft_slider); h_soft.addWidget(self.lbl_soft)
+        lay_ctrl.addLayout(h_soft)
+
+        l2 = QLabel("Noise:"); l2.setProperty("role", "title")
+        lay_ctrl.addWidget(l2)
+        h_noise = QHBoxLayout()
+        self.noise_slider = QSlider(Qt.Horizontal); self.noise_slider.setRange(0, 100); self.noise_slider.setValue(0)
+        self.noise_slider.valueChanged.connect(lambda v: self.lbl_noise.setText(str(v)))
+        self.noise_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_noise = QLabel("0"); self.lbl_noise.setFixedWidth(30)
+        h_noise.addWidget(self.noise_slider); h_noise.addWidget(self.lbl_noise)
+        lay_ctrl.addLayout(h_noise)
+
+        l5 = QLabel("Error Bleed:"); l5.setProperty("role", "title")
+        lay_ctrl.addWidget(l5)
+        h_bleed = QHBoxLayout()
+        self.bleed_slider = QSlider(Qt.Horizontal); self.bleed_slider.setRange(0, 100); self.bleed_slider.setValue(100)
+        self.bleed_slider.valueChanged.connect(lambda v: self.lbl_bleed.setText(f"{v}%"))
+        self.bleed_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_bleed = QLabel("100%"); self.lbl_bleed.setFixedWidth(35)
+        h_bleed.addWidget(self.bleed_slider); h_bleed.addWidget(self.lbl_bleed)
+        lay_ctrl.addLayout(h_bleed)
+
+        lay_ctrl.addStretch()
+        self.toolbox.addItem(page_ctrl, "Dither Control")
+
+        # 5. Animation Settings
+        page_anim = QWidget(); lay_anim = QVBoxLayout(page_anim)
+        chk_style = """
+            QCheckBox { color: #1c2333; background: transparent; spacing: 5px; }
+            QCheckBox::indicator { width: 14px; height: 14px; background-color: #e6ecf7; border: 1px solid #9ca7c2; border-radius: 3px; }
+            QCheckBox::indicator:hover { background-color: #d8dfee; }
+            QCheckBox::indicator:checked { background-color: #5a6b8c; border: 1px solid #5a6b8c; }
+        """
+        self.chk_animate = QCheckBox("Animate Static Image")
+        self.chk_animate.setStyleSheet(chk_style)
+        self.chk_animate.stateChanged.connect(self.on_animate_changed)
+        self.chk_animate.stateChanged.connect(self.trigger_update)
+        lay_anim.addWidget(self.chk_animate)
+        
+        lbl_anim_mode = QLabel("Animation Mode:")
+        lbl_anim_mode.setProperty("role", "title")
+        lay_anim.addWidget(lbl_anim_mode)
+        
+        self.anim_mode_combo = QComboBox()
+        self.anim_mode_combo.addItems(["Scrolling Pattern", "Jitter / Noise"])
+        self.anim_mode_combo.setEnabled(False)
+        self.anim_mode_combo.currentTextChanged.connect(self.trigger_update)
+        lay_anim.addWidget(self.anim_mode_combo)
+        
+        lbl_anim_frames = QLabel("Frame Count:")
+        lbl_anim_frames.setProperty("role", "title")
+        lay_anim.addWidget(lbl_anim_frames)
+        
+        h_frames = QHBoxLayout()
+        self.anim_frames_slider = QSlider(Qt.Horizontal)
+        self.anim_frames_slider.setRange(4, 24)
+        self.anim_frames_slider.setValue(8)
+        self.anim_frames_slider.setEnabled(False)
+        self.anim_frames_slider.valueChanged.connect(lambda v: self.lbl_anim_frames_val.setText(str(v)))
+        self.anim_frames_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_anim_frames_val = QLabel("8")
+        self.lbl_anim_frames_val.setFixedWidth(30)
+        h_frames.addWidget(self.anim_frames_slider)
+        h_frames.addWidget(self.lbl_anim_frames_val)
+        lay_anim.addLayout(h_frames)
+        
+        lbl_anim_speed = QLabel("Frame Delay (ms):")
+        lbl_anim_speed.setProperty("role", "title")
+        lay_anim.addWidget(lbl_anim_speed)
+        
+        h_speed = QHBoxLayout()
+        self.anim_speed_slider = QSlider(Qt.Horizontal)
+        self.anim_speed_slider.setRange(50, 500)
+        self.anim_speed_slider.setValue(100)
+        self.anim_speed_slider.setEnabled(False)
+        self.anim_speed_slider.valueChanged.connect(lambda v: self.lbl_anim_speed_val.setText(f"{v}ms"))
+        self.anim_speed_slider.valueChanged.connect(self.trigger_update)
+        self.lbl_anim_speed_val = QLabel("100ms")
+        self.lbl_anim_speed_val.setFixedWidth(40)
+        h_speed.addWidget(self.anim_speed_slider)
+        h_speed.addWidget(self.lbl_anim_speed_val)
+        lay_anim.addLayout(h_speed)
+        
+        lay_anim.addStretch()
+        self.toolbox.addItem(page_anim, "Animation")
+
+        left_layout.addWidget(self.toolbox)
+
+
+        self.btn_close_img = QPushButton(tr("btn_close_img", "Close Image"))
+        self.btn_close_img.clicked.connect(self.close_image)
+        left_layout.addWidget(self.btn_close_img)
+
+        btn_sel = QPushButton(tr("btn_proc_sel", "Process Selected")); btn_sel.clicked.connect(self.process_selected)
+        btn_all = QPushButton(tr("btn_proc_all", "Process All")); btn_all.clicked.connect(self.process_all)
+        left_layout.addWidget(btn_sel)
+        left_layout.addWidget(btn_all)
+
+        # RIGHT (Preview)
+        right_layout = QVBoxLayout(); main_layout.addLayout(right_layout, 3)
+        self.preview_widget = ZoomableImageWidget()
+        right_layout.addWidget(self.preview_widget)
+
+    # --- LOGIC ---
+
+    def change_output_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if d:
+            self.output_dir = Path(d)
+            self.output_label.setText(f"{self.output_dir}")
+            QMessageBox.information(self, "Success", f"Output folder changed to:\n{self.output_dir}")
+
+    def open_output_folder(self):
+        d = self.output_dir
+        if not d and self.image_paths:
+            d = self.path_map.get(self.image_paths[0], self.image_paths[0]).parent
+        if d and d.exists():
+            os.startfile(str(d))
+        else:
+            QMessageBox.information(self, "Info", "Output folder does not exist yet. Process an image first.")
+
+    def on_palette_change(self, text):
+        self.btn_pick_color.setVisible("Custom" in text)
+        self.trigger_update()
+
+    def pick_custom_colors(self):
+        c1 = QColorDialog.getColor(QColor(*self.custom_col_1), self, "Pick Foreground")
+        if c1.isValid(): 
+            self.custom_col_1 = [c1.red(), c1.green(), c1.blue()]
+            c2 = QColorDialog.getColor(QColor(*self.custom_col_2), self, "Pick Background")
+            if c2.isValid():
+                self.custom_col_2 = [c2.red(), c2.green(), c2.blue()]
+                self.trigger_update()
+
+    def update_scale_label(self, val): self.lbl_scale.setText(f"{val}x")
+    def update_bloom_label(self, val): self.lbl_bloom_int.setText(str(val))
+    def update_rad_label(self, val): self.lbl_bloom_rad.setText(str(val))
+
+    def add_dropped_files(self, files):
+        self.add_files(files)
+
+    def add_images(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Images", "", IMAGE_FILTER)
+        if not files: return
+        self.add_files([Path(f) for f in files])
+    
+    def add_gif(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select GIF", "", GIF_FILTER)
+        if not files: return
+        self.add_files([Path(f) for f in files])
+
+    def add_files(self, paths):
+        # 1. SCAN & ASK (Only for non-GIFs)
+        large_files = []
+        for p in paths:
+            if p.suffix.lower() == ".gif": continue 
+            try:
+                with Image.open(p) as tmp:
+                    tmp = ImageOps.exif_transpose(tmp) 
+                    if tmp.width > 1500 or tmp.height > 1500:
+                        large_files.append(p)
+            except: pass
+            
+        do_downscale = False
+        if large_files:
+            ans = QMessageBox.question(self, "Resolution Check", 
+                f"{len(large_files)} images are larger than 1500px.\n"
+                "Downscaling is recommended for better effect.\n\n"
+                "Auto-downscale to 1500px width?", 
+                QMessageBox.Yes | QMessageBox.No)
+            if ans == QMessageBox.Yes: do_downscale = True
+
+        prog = None
+        if do_downscale:
+            prog = QProgressDialog("Caching...", None, 0, len(paths), self)
+            prog.setWindowModality(Qt.ApplicationModal); prog.show()
+
+        for i, p in enumerate(paths):
+            item = QListWidgetItem(p.name)
+            
+            if p.suffix.lower() == ".gif":
+                item.setData(Qt.UserRole, p)
+                self.file_list.addItem(item)
+                self.image_paths.append(p)
+                self.path_map[p] = p
+                continue
+
+            if do_downscale and p in large_files:
+                try:
+                    with Image.open(p) as img:
+                        img = ImageOps.exif_transpose(img)
+                        ratio = 1500 / float(img.width)
+                        new_h = int(img.height * ratio)
+                        img = img.resize((1500, new_h), Image.Resampling.LANCZOS)
+                        
+                        cache_path = CACHE_DIR / f"{p.stem}_cached_1500px.png"
+                        img.save(cache_path)
+                        
+                        item.setText(f"{p.name} (Cached)")
+                        item.setData(Qt.UserRole, cache_path) 
+                        self.file_list.addItem(item)
+                        self.image_paths.append(cache_path)
+                        self.path_map[cache_path] = p
+                except Exception as e: print(e)
+            else:
+                item.setData(Qt.UserRole, p)
+                self.file_list.addItem(item)
+                self.image_paths.append(p)
+                self.path_map[p] = p
+            
+            if prog: prog.setValue(i+1)
+        
+        if prog: prog.close()
+        if self.file_list.count() > 0 and self.file_list.currentRow() < 0:
+            self.file_list.setCurrentRow(0)
+
+    def clear_list(self):
+        self.close_image()
+        self.image_paths.clear(); self.file_list.clear(); self.path_map.clear()
+        try:
+            for f in CACHE_DIR.glob("*"):
+                try: os.remove(f)
+                except: pass
+        except: pass
+
+    def close_image(self):
+        """Forces the image preview to close/unload."""
+        self.preview_proxy_img = None
+        self.loaded_proxy_path = ""
+        self.current_preview_path = None
+        self.preview_widget.set_images(None, None) 
+
+    def on_animate_changed(self, state):
+        enabled = self.chk_animate.isChecked()
+        self.anim_mode_combo.setEnabled(enabled)
+        self.anim_frames_slider.setEnabled(enabled)
+        self.anim_speed_slider.setEnabled(enabled)
+        if self.current_preview_path:
+            is_gif = self.current_preview_path.suffix.lower() == ".gif"
+
+    def on_file_selected(self, item):
+        if not item: 
+            self.close_image()
+            return
+        real_path = item.data(Qt.UserRole)
+        is_gif = real_path.suffix.lower() == ".gif"
+        
+        if real_path and str(real_path) != self.loaded_proxy_path:
+            self.current_preview_path = real_path
+            try:
+                # Use shared widget logic for GIF playback if possible
+                self.preview_widget.set_images(None, real_path) 
+                
+                # But we also need a proxy for processing preview
+                temp_img = Image.open(real_path)
+                
+                if getattr(temp_img, "is_animated", False):
+                    temp_img.seek(0)
+                
+                temp_img = ImageOps.exif_transpose(temp_img)
+                full_img = temp_img.convert("RGBA")
+                
+                # Create a proxy for display
+                MAX_P = PREVIEW_MAX_SIZE
+                w, h = full_img.size
+                if max(w, h) > MAX_P:
+                    ratio = min(MAX_P/w, MAX_P/h)
+                    self.preview_proxy_img = full_img.resize((int(w*ratio), int(h*ratio)), Image.Resampling.BOX)
+                else:
+                    self.preview_proxy_img = full_img.copy()
+                
+                self.loaded_proxy_path = str(real_path)
+                
+                self.trigger_update()
+                
+            except Exception as e:
+                print(f"Load Error: {e}")
+
+    def trigger_update(self):
+        self.debounce_timer.start()
+        if self.preview_proxy_img is not None and self.meter:
+            self.meter.set_message("Processing...")
+
+
+    def start_preview_worker(self):
+        if not self.preview_proxy_img: return
+        
+        is_animating = self.chk_animate.isChecked() or (self.current_preview_path and self.current_preview_path.suffix.lower() == ".gif")
+        
+        if is_animating:
+            # Live Animated Preview
+            if hasattr(self, "live_gif_worker") and self.live_gif_worker.isRunning():
+                self.live_gif_worker.stop()
+                self.live_gif_worker.wait() # wait for it to exit safely
+                
+            timestamp = int(time.time() * 1000)
+            temp_out = CACHE_DIR / f"preview_gif_{timestamp}"
+            temp_out.mkdir(parents=True, exist_ok=True)
+            
+            self.live_gif_worker = BatchDitherWorker(
+                [self.current_preview_path], 
+                temp_out, 
+                self._get_params(), 
+                [self.custom_col_1, self.custom_col_2]
+            )
+            # Use same logic as gif preview finish
+            self.live_gif_worker.finished.connect(lambda c: self.on_live_gif_preview_finished(temp_out))
+            self.live_gif_worker.start()
+        else:
+            # Static Preview
+            params = self._get_params()
+            self.preview_worker.set_data(self.preview_proxy_img, params, [self.custom_col_1, self.custom_col_2])
+            self.preview_worker.start()
+    
+    def _get_params(self):
+        return {
+            "scale": self.scale_slider.value(),
+            "palette": self.palette_combo.currentText(),
+            "mode": self.mode_combo.currentText(),
+            "bloom_intensity": self.bloom_int_slider.value(),
+            "bloom_radius": self.bloom_rad_slider.value(),
+            "brightness": self.br_slider.value(),
+            "contrast": self.ct_slider.value() / 10.0,
+            "softness": self.soft_slider.value(),
+            "noise": self.noise_slider.value(),
+            "bleed": self.bleed_slider.value() / 100.0,
+            "animate_static": self.chk_animate.isChecked(),
+            "anim_mode": self.anim_mode_combo.currentText(),
+            "anim_frames": self.anim_frames_slider.value(),
+            "anim_speed": self.anim_speed_slider.value()
+        }
+
+    def on_preview_ready(self, pix_res):
+        # Safety Check: If preview was cleared while worker was running, ignore result
+        if not self.current_preview_path or not self.preview_proxy_img:
+            if self.meter: self.meter.set_message(None)
+            return
+
+        if pix_res:
+            self.preview_widget.set_result_pixmap(pix_res)
+            
+        if self.meter: self.meter.set_message(None)
+
+    def ensure_output_dir(self, sample):
+        if not self.output_dir:
+            original_source = self.path_map.get(sample, sample)
+            self.output_dir = original_source.parent / "LABOKit_Dither"
+            self.output_dir.mkdir(exist_ok=True)
+            self.output_label.setText(f"{self.output_dir}")
+        return self.output_dir
+
+    def process_selected(self):
+        sel = self.file_list.selectedItems()
+        if sel:
+            targets = [i.data(Qt.UserRole) for i in sel]
+            self._run_process(targets)
+
+    def process_all(self):
+        targets = [self.file_list.item(i).data(Qt.UserRole) for i in range(self.file_list.count())]
+        self._run_process(targets)
+
+
+    def on_live_gif_preview_finished(self, temp_out):
+        generated = list(temp_out.glob("*.gif"))
+        if generated and self.current_preview_path:
+            self.preview_widget.set_images(None, generated[0])
+            
+        if self.meter: self.meter.set_message(None)
+
+    def _run_process(self, paths):
+        if not paths: return
+        out = self.ensure_output_dir(paths[0])
+        
+        self.dlg = QProgressDialog(tr("msg_done", "Initializing..."), "Cancel", 0, len(paths), self)
+        self.dlg.setWindowModality(Qt.ApplicationModal)
+        self.dlg.show()
+        
+        self.batch_worker = BatchDitherWorker(
+            paths, 
+            out, 
+            self._get_params(), 
+            [self.custom_col_1, self.custom_col_2]
+        )
+        self.batch_worker.progress.connect(self.on_batch_progress)
+        self.batch_worker.finished.connect(self.on_batch_finished)
+        self.dlg.canceled.connect(self.batch_worker.stop)
+        self.batch_worker.start()
+
+    def on_batch_progress(self, idx, msg):
+        self.dlg.setLabelText(msg)
+        self.dlg.setValue(idx)
+        if self.meter: self.meter.set_message(msg)
+
+    def on_batch_finished(self, count):
+        self.dlg.close()
+        if self.meter: self.meter.set_message(None)
+        QMessageBox.information(self, tr("msg_done", "Done"), f"Processed {count} files.\nSaved to: {self.output_dir}")
+
+def create_tab(parent=None): return DitheringTab(parent)
